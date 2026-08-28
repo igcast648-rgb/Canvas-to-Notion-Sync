@@ -42,14 +42,18 @@ jobs:
          "sub-assignment":"Assignment","quiz":"Quiz",
          "discussion-topic":"Assignment"}
 
-      # Upgrade the type from the title, so "Examen #2" becomes Exam and
-      # "Final Exam" becomes Final. "Final Project" stays an Assignment.
+      # Canvas reports New Quizzes as plain assignments, so the type is read
+      # from the title instead. First option whose keyword appears wins, in
+      # the order written here - so "Final Exam" lands on Final, not Exam.
+      # Keywords match at a word start: "quiz" catches "Quizzes", "exam"
+      # catches "Examen". Edit this line to retune.
       TYPE_INFER: "true"
+      TYPE_KEYWORDS: '{"Final":["final"],"Exam":["exam","midterm"],"Quiz":["quiz","qotd"]}'
 
       # Canvas course codes -> page titles in your Courses database.
       # Keys match as a PREFIX, so "BIO 325" also catches "BIO 325-51960"
-      # and survives next semester's section number. Edit this line directly
-      # when you add a course; course codes aren't secret.
+      # and keeps working when the section number changes next semester.
+      # To add a course later, add another "code":"page name" pair here.
       COURSE_ALIASES: '{"CH 320M":"Organic Chemistry","BIO 325":"Genetics","SDS 320E":"Statistics"}'
 
     steps:
