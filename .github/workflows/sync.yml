@@ -23,17 +23,32 @@ jobs:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
       TIMEZONE: "America/Chicago"
-      # Uncomment and edit any of these only if your Notion column
-      # names differ from the defaults.
-      # PROP_TITLE: "Name"
-      # PROP_DUE: "Due Date"
-      # PROP_COURSE: "Course"
-      # PROP_CANVAS_ID: "Canvas ID"
-      # PROP_URL: "Link"
-      # PROP_TYPE: "Type"
-      # PROP_STATUS: "Status"
-      # PROP_REMINDERS: "Reminders Sent"
-      # STATUS_DEFAULT: "Not started"
+
+      # --- Your Notion column names ---
+      PROP_TITLE: "Name"
+      PROP_DUE: "Due Date"
+      PROP_COURSE: "Course Name"        # a relation to your Courses database
+      PROP_TYPE: "Assessment Type"      # select: Final / Exam / Quiz / Assignment
+      PROP_CANVAS_ID: "Canvas ID"
+      PROP_REMINDERS: "Reminders Sent"
+      PROP_STATUS: "Status"
+      # PROP_URL: "Link"                # uncomment if you add a URL column
+      # STATUS_DEFAULT: "To-Do"         # uncomment to set Status on new rows
+
+      # Canvas only knows assignment/quiz/discussion. Map those onto the
+      # options your database actually has.
+      TYPE_MAP: >-
+        {"assignment":"Assignment","assignment-override":"Assignment",
+         "sub-assignment":"Assignment","quiz":"Quiz",
+         "discussion-topic":"Assignment"}
+
+      # Upgrade the type from the title, so "Examen #2" becomes Exam and
+      # "Final Exam" becomes Final. "Final Project" stays an Assignment.
+      TYPE_INFER: "true"
+
+      # Canvas course names that don't match a page title in your Courses
+      # database. Add entries as the log reports them.
+      # COURSE_ALIASES: '{"CH 320E":"Organic Chemistry"}'
 
     steps:
       - uses: actions/checkout@v4
