@@ -1,0 +1,76 @@
+name: Canvas to Notion sync
+
+on:
+  schedule:
+    # Hourly, at :10 past. The hourly cadence is what lets the 4/3/2/1-hour
+    # reminders land close to their marks. Off-the-hour timing avoids GitHub's
+    # busiest scheduling minute, when delayed runs are most common.
+    - cron: "10 * * * *"
+  workflow_dispatch:      # lets you run it manually from the Actions tab
+
+# If a run is still going when the next hour fires, let it finish rather than
+# starting a second one that would race it writing to Notion.
+concurrency:
+  group: canvas-notion-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+      TIMEZONE: "America/Chicago"
+      # Uncomment and edit any of these only if your Notion column
+      # names differ from the defaults.
+      # PROP_TITLE: "Name"
+      # PROP_DUE: "Due Date"
+      # PROP_COURSE: "Course"
+      # PROP_CANVAS_ID: "Canvas ID"
+      # PROP_URL: "Link"
+      # PROP_TYPE: "Type"
+      # PROP_STATUS: "Status"
+      # PROP_REMINDERS: "Reminders Sent"
+      # STATUS_DEFAULT: "Not started"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Pull assignments from Canvas
+        env:
+          CANVAS_ICS_URL: ${{ secrets.CANVAS_ICS_URL }}
+        run: python canvas_notion_sync.py
+
+      # Runs even if the Canvas fetch failed, so a Canvas outage can't
+      # swallow a reminder for something already in Notion.
+      - name: Send due-date reminders
+        if: always()
+        env:
+          # --- Email delivery ---
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}          # optional; defaults to SMTP_USER
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}        # optional; defaults to smtp.gmail.com
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}        # optional; defaults to 587
+
+          # --- Phone push delivery (optional, leave unset if not using) ---
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+
+          # auto = use whichever channels have credentials set.
+          # Force one with "email" or "ntfy", or use both: "email,ntfy"
+          REMINDER_CHANNEL: "auto"
+
+          REMINDER_TIERS: "4,3,2,1"
+          DONE_STATUSES: "Done,Complete,Completed,Submitted,Turned in"
+        run: python reminders.py
