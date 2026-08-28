@@ -317,8 +317,20 @@ class CourseResolver:
             return page_id
 
         # 1. An explicit alias you configured always wins.
+        #
+        # Canvas course codes carry unstable suffixes - "BIO 325" shows up as
+        # "BIO 325-51960", and a code can trail a meeting time like
+        # "SDS 320E TTh 11-12:30 PM". So an alias key matches when it is
+        # CONTAINED in the Canvas name, not only when it equals it. That way
+        # you write "BIO 325" once and it keeps working when the section
+        # number changes next semester. Longest key wins, so a more specific
+        # alias always beats a broader one.
+        alias_hits = sorted((k for k in self.aliases if k and k in key),
+                            key=len, reverse=True)
         if key in self.aliases:
-            target = norm(self.aliases[key])
+            alias_hits.insert(0, key)
+        for alias_key in alias_hits:
+            target = norm(self.aliases[alias_key])
             if target in self.by_norm:
                 pid, title = self.by_norm[target]
                 return hit(pid, title, "alias")
