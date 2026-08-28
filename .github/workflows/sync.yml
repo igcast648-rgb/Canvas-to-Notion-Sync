@@ -46,9 +46,11 @@ jobs:
       # "Final Exam" becomes Final. "Final Project" stays an Assignment.
       TYPE_INFER: "true"
 
-      # Canvas course names that don't match a page title in your Courses
-      # database. Add entries as the log reports them.
-      # COURSE_ALIASES: '{"CH 320E":"Organic Chemistry"}'
+      # Canvas course codes -> page titles in your Courses database.
+      # Keys match as a PREFIX, so "BIO 325" also catches "BIO 325-51960"
+      # and keeps working when the section number changes next semester.
+      # To add a course later, add another "code":"page name" pair here.
+      COURSE_ALIASES: '{"CH 320M":"Organic Chemistry","BIO 325":"Genetics","SDS 320E":"Statistics"}'
 
     steps:
       - uses: actions/checkout@v4
@@ -85,7 +87,6 @@ jobs:
           # auto = use whichever channels have credentials set.
           # Force one with "email" or "ntfy", or use both: "email,ntfy"
           REMINDER_CHANNEL: "auto"
-
           REMINDER_TIERS: "4,3,2,1"
           DONE_STATUSES: "Done,Complete,Completed,Submitted,Turned in"
         run: python reminders.py
