@@ -101,20 +101,29 @@ CFG = {
     "tz": env("TIMEZONE", "America/Chicago"),
     "all_day_time": env("ALL_DAY_DUE_TIME", "23:59"),
     "course_aliases": env("COURSE_ALIASES", ""),
+    "course_match_prop": env("COURSE_MATCH_PROP", "Course Tag"),
     "course_create_missing": env_bool("COURSE_CREATE_MISSING", False),
     "type_map": env("TYPE_MAP", ""),
+    "type_keywords": env("TYPE_KEYWORDS", ""),
     "type_infer": env_bool("TYPE_INFER", True),
     "dry_run": env_bool("DRY_RUN", False),
 }
 
-# Canvas only knows "assignment / quiz / discussion". Notion databases usually
-# have richer options (Exam, Final). These rules upgrade the type based on the
-# assignment title, and are deliberately narrow: "Final Project" must NOT be
-# typed as a Final, so the Final rule requires the word "exam" alongside it.
-DEFAULT_TYPE_KEYWORDS = [
-    ("Final", r"\bfinal\s+(exam|test)\b|\bfinals?\b(?=\s*$)"),
-    ("Exam", r"\bexams?\b|\bexamen(es)?\b|\bmidterms?\b"),
-]
+# Canvas can't tell you what KIND of thing something is. A "New Quiz" is
+# delivered as an assignment, so the feed calls "Quiz 22: Chapter 23" an
+# assignment. These rules read the title instead and win over the Canvas type.
+#
+# Order matters - the first option whose keyword appears wins. So "Final Exam"
+# lands on Final rather than Exam, because Final is listed first.
+#
+# Keywords match at a word start, so "exam" also catches "Exams" and "Examen",
+# and "quiz" catches "Quizzes". Override the whole thing with TYPE_KEYWORDS
+# in the workflow if you want different words.
+DEFAULT_TYPE_KEYWORDS = {
+    "Final": ["final"],
+    "Exam": ["exam", "midterm"],
+    "Quiz": ["quiz", "qotd"],
+}
 
 
 def die(msg):
@@ -260,13 +269,21 @@ def norm(s):
     return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
 
 
-def infer_type(title, kind, type_map):
-    """Pick the Notion option for an item: title keywords first (so a quiz
-    actually named 'Exam 2' is typed Exam), then the Canvas item type."""
+def infer_type(title, kind, type_map, keywords=None):
+    """Pick the Notion option for an item.
+
+    Title keywords come first, because Canvas's own type is unreliable: it
+    reports New Quizzes as plain assignments. Only if no keyword matches do
+    we fall back to what Canvas said the item was.
+    """
     if CFG["type_infer"]:
-        for option, pattern in DEFAULT_TYPE_KEYWORDS:
-            if re.search(pattern, title, re.IGNORECASE):
-                return option
+        rules = keywords if keywords is not None else DEFAULT_TYPE_KEYWORDS
+        for option, words in rules.items():
+            for word in words:
+                # \b<word> matches at a word start, so "quiz" also catches
+                # "Quizzes" and "exam" catches "Examen".
+                if re.search(r"\b" + re.escape(str(word)), title, re.IGNORECASE):
+                    return option
     return type_map.get(kind, "Assignment")
 
 
@@ -290,20 +307,56 @@ class CourseResolver:
         self.notion = notion
         self.db_id = related_db_id
         self.aliases = {norm(k): v for k, v in aliases.items()}
-        self.by_norm = {}
+        self.by_norm = {}       # normalized page title -> (page id, title)
+        self.by_tag = {}        # normalized Course Tag -> (page id, title, tag)
         self.unmatched = set()
         self.seen = {}          # canvas course name -> matched page title, or None
         self._load()
 
+    @staticmethod
+    def _tag_values(prop):
+        """Read the Course Tag column, whichever property type it happens to
+        be. Multi-select is supported so one course page can carry several
+        Canvas codes (cross-listed sections, a lab plus its lecture)."""
+        if not prop:
+            return []
+        t = prop.get("type")
+        if t == "select":
+            s = prop.get("select")
+            return [s["name"]] if s and s.get("name") else []
+        if t == "multi_select":
+            return [x["name"] for x in prop.get("multi_select", []) if x.get("name")]
+        if t == "rich_text":
+            text = "".join(x.get("plain_text", "") for x in prop.get("rich_text", []))
+            return [text] if text.strip() else []
+        if t == "title":
+            text = "".join(x.get("plain_text", "") for x in prop.get("title", []))
+            return [text] if text.strip() else []
+        return []
+
     def _load(self):
+        tag_prop = CFG["course_match_prop"]
         for page in self.notion.all_pages(self.db_id):
-            for prop in page.get("properties", {}).values():
+            props = page.get("properties", {})
+
+            for prop in props.values():
                 if prop.get("type") == "title":
                     name = "".join(x.get("plain_text", "")
                                    for x in prop.get("title", []))
                     if name:
                         self.by_norm[norm(name)] = (page["id"], name)
                     break
+
+            title = next((t for _, t in [self.by_norm.get(
+                norm("".join(x.get("plain_text", "")
+                     for x in p.get("title", []))), (None, None))
+                for p in props.values() if p.get("type") == "title"]
+                if t), "")
+
+            if tag_prop and tag_prop in props:
+                for tag in self._tag_values(props[tag_prop]):
+                    if norm(tag):
+                        self.by_tag[norm(tag)] = (page["id"], title or tag, tag)
 
     def resolve(self, course_text):
         if not course_text:
@@ -315,6 +368,22 @@ class CourseResolver:
         def hit(page_id, title, how):
             self.seen[course_text] = (title, how)
             return page_id
+
+        # 0. The Course Tag column on the Courses page wins over everything.
+        #    You paste the Canvas course code there and it just works - no
+        #    config file, no redeploy, and you can fix it from your phone.
+        if key in self.by_tag:
+            pid, title, _ = self.by_tag[key]
+            return hit(pid, title, "Course Tag")
+
+        # A tag shorter than the Canvas name still counts, so "BIO 325"
+        # keeps matching when the section suffix changes to BIO 325-67312.
+        tag_hits = sorted((tk for tk in self.by_tag
+                           if len(tk) >= 4 and (tk in key or key in tk)),
+                          key=len, reverse=True)
+        if tag_hits:
+            pid, title, _ = self.by_tag[tag_hits[0]]
+            return hit(pid, title, "Course Tag ~")
 
         # 1. An explicit alias you configured always wins.
         #
@@ -604,6 +673,9 @@ def main():
     type_map = dict(TYPE_LABELS)
     type_map.update(load_json_env(CFG["type_map"], "TYPE_MAP"))
 
+    type_keywords = load_json_env(CFG["type_keywords"], "TYPE_KEYWORDS") \
+        or DEFAULT_TYPE_KEYWORDS
+
     print("Loading existing Notion rows...")
     existing = {}
     for page in notion.all_pages(db_id):
@@ -628,7 +700,8 @@ def main():
             "course": course_value,
             "canvas_id": item["canvas_id"],
             "url": item["url"],
-            "type": infer_type(item["title"], item["kind"], type_map),
+            "type": infer_type(item["title"], item["kind"], type_map,
+                               type_keywords),
         }
         page = existing.get(cid)
 
