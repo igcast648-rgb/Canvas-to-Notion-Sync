@@ -70,14 +70,14 @@ EXPECTED_KEPT = {
 
 
 def test():
-    items, dropped = collect_assignments(SAMPLE, "America/Chicago")
+    items, dropped, _ = collect_assignments(SAMPLE, "America/Chicago")
     kept = set(items)
 
     print(f"Kept    ({len(kept)}):")
     for k in sorted(kept, key=lambda x: items[x]["due"] or ""):
         i = items[k]
         print(f"   - {i['title']:<28} course={i['course']:<12} "
-              f"type={i['type']:<11} due={i['due']}")
+              f"kind={i['kind']:<20} due={i['due']}")
     print(f"Dropped ({dropped}) non-gradeable entries.\n")
 
     assert kept == EXPECTED_KEPT, f"unexpected result: {kept ^ EXPECTED_KEPT}"
@@ -87,9 +87,9 @@ def test():
     assert items["event-assignment-9876543"]["title"] == "Problem Set 3"
     assert items["event-assignment-9876543"]["course"] == "MATH 2413"
     # Quizzes and discussions must be labeled distinctly.
-    assert items["event-quiz-112233"]["type"] == "Quiz"
-    assert items["event-discussion-topic-4455"]["type"] == "Discussion"
-    assert items["event-assignment-override-778"]["type"] == "Assignment"
+    assert items["event-quiz-112233"]["kind"] == "quiz"
+    assert items["event-discussion-topic-4455"]["kind"] == "discussion-topic"
+    assert items["event-assignment-override-778"]["kind"] == "assignment-override"
     # Timezone conversion: 23:59 UTC -> 18:59 Central.
     assert items["event-assignment-9876543"]["due"].startswith("2026-09-02T18:59")
 

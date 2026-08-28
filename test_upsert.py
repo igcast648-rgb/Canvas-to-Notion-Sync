@@ -107,7 +107,7 @@ FOLDED = (
 
 
 def test_folding():
-    items, dropped = sync.collect_assignments(FOLDED, "America/Chicago")
+    items, dropped, _ = sync.collect_assignments(FOLDED, "America/Chicago")
     assert len(items) == 1 and dropped == 0
     item = items["event-assignment-777"]
     assert item["title"] == (

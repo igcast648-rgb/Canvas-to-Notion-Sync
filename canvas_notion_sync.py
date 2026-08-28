@@ -96,10 +96,25 @@ CFG = {
     "p_url": env("PROP_URL", "Link"),
     "p_type": env("PROP_TYPE", "Type"),
     "p_reminders": env("PROP_REMINDERS", "Reminders Sent"),
+    "p_status": env("PROP_STATUS", "Status"),
     "status_default": env("STATUS_DEFAULT", ""),
     "tz": env("TIMEZONE", "America/Chicago"),
+    "all_day_time": env("ALL_DAY_DUE_TIME", "23:59"),
+    "course_aliases": env("COURSE_ALIASES", ""),
+    "course_create_missing": env_bool("COURSE_CREATE_MISSING", False),
+    "type_map": env("TYPE_MAP", ""),
+    "type_infer": env_bool("TYPE_INFER", True),
     "dry_run": env_bool("DRY_RUN", False),
 }
+
+# Canvas only knows "assignment / quiz / discussion". Notion databases usually
+# have richer options (Exam, Final). These rules upgrade the type based on the
+# assignment title, and are deliberately narrow: "Final Project" must NOT be
+# typed as a Final, so the Final rule requires the word "exam" alongside it.
+DEFAULT_TYPE_KEYWORDS = [
+    ("Final", r"\bfinal\s+(exam|test)\b|\bfinals?\b(?=\s*$)"),
+    ("Exam", r"\bexams?\b|\bexamen(es)?\b|\bmidterms?\b"),
+]
 
 
 def die(msg):
@@ -176,12 +191,26 @@ def parse_ics_datetime(params, value, tzname):
         return None
     value = value.strip()
 
-    # All-day form: 20260907
+    # All-day form: 20260907.
+    #
+    # Canvas exports an assignment as an all-day event when its due date has no
+    # explicit time - but in Canvas that still means "by 11:59pm that day", and
+    # a bare date would show up in Notion as "Aug 30" with no time at all. So
+    # pin it to the real deadline instead of dropping the time.
     if params.get("VALUE") == "DATE" or re.fullmatch(r"\d{8}", value):
         try:
-            return datetime.strptime(value[:8], "%Y%m%d").date().isoformat()
+            d = datetime.strptime(value[:8], "%Y%m%d")
         except ValueError:
             return None
+        try:
+            hh, mm = (int(x) for x in CFG["all_day_time"].split(":", 1))
+        except (ValueError, AttributeError):
+            hh, mm = 23, 59
+        try:
+            tz = ZoneInfo(tzname)
+        except Exception:
+            tz = timezone.utc
+        return d.replace(hour=hh, minute=mm, tzinfo=tz).isoformat()
 
     m = re.fullmatch(r"(\d{8})T(\d{6})(Z?)", value)
     if not m:
@@ -226,6 +255,99 @@ def clean_summary(summary):
     return s, ""
 
 
+def norm(s):
+    """Squash a course name to letters+digits so 'MATH 2413' == 'math2413'."""
+    return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+
+def infer_type(title, kind, type_map):
+    """Pick the Notion option for an item: title keywords first (so a quiz
+    actually named 'Exam 2' is typed Exam), then the Canvas item type."""
+    if CFG["type_infer"]:
+        for option, pattern in DEFAULT_TYPE_KEYWORDS:
+            if re.search(pattern, title, re.IGNORECASE):
+                return option
+    return type_map.get(kind, "Assignment")
+
+
+def load_json_env(raw, label):
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        die(f"{label} isn't valid JSON: {e}")
+    if not isinstance(data, dict):
+        die(f"{label} must be a JSON object, e.g. {{\"CH 320E\": \"Organic Chemistry\"}}")
+    return data
+
+
+class CourseResolver:
+    """Turns the course name Canvas puts in '[brackets]' into a Notion page in
+    your Courses database, so the Course relation can be filled in."""
+
+    def __init__(self, notion, related_db_id, aliases):
+        self.notion = notion
+        self.db_id = related_db_id
+        self.aliases = {norm(k): v for k, v in aliases.items()}
+        self.by_norm = {}
+        self.unmatched = set()
+        self.seen = {}          # canvas course name -> matched page title, or None
+        self._load()
+
+    def _load(self):
+        for page in self.notion.all_pages(self.db_id):
+            for prop in page.get("properties", {}).values():
+                if prop.get("type") == "title":
+                    name = "".join(x.get("plain_text", "")
+                                   for x in prop.get("title", []))
+                    if name:
+                        self.by_norm[norm(name)] = (page["id"], name)
+                    break
+
+    def resolve(self, course_text):
+        if not course_text:
+            return None
+        key = norm(course_text)
+        if not key:
+            return None
+
+        def hit(page_id, title, how):
+            self.seen[course_text] = (title, how)
+            return page_id
+
+        # 1. An explicit alias you configured always wins.
+        if key in self.aliases:
+            target = norm(self.aliases[key])
+            if target in self.by_norm:
+                pid, title = self.by_norm[target]
+                return hit(pid, title, "alias")
+
+        # 2. Exact match on the course page title.
+        if key in self.by_norm:
+            pid, title = self.by_norm[key]
+            return hit(pid, title, "exact")
+
+        # 3. One name contained in the other ("Genetics" vs "Genetics 301").
+        contained = [(pid, t) for nk, (pid, t) in self.by_norm.items()
+                     if len(nk) >= 4 and (nk in key or key in nk)]
+        if len(contained) == 1:
+            return hit(contained[0][0], contained[0][1], "partial")
+
+        self.seen[course_text] = (None, "no match")
+        self.unmatched.add(course_text)
+        return None
+
+    def create(self, course_text):
+        """Only used when COURSE_CREATE_MISSING is on."""
+        page = self.notion.create_page(self.db_id, {
+            "title": {"title": [{"text": {"content": course_text[:2000]}}]}
+        })
+        # Notion needs the real title property name, not the literal "title".
+        self.by_norm[norm(course_text)] = (page["id"], course_text)
+        return page["id"]
+
+
 def collect_assignments(ics_text, tzname):
     items = {}
     dropped = 0
@@ -260,9 +382,10 @@ def collect_assignments(ics_text, tzname):
             "course": course,
             "due": due,
             "url": url,
-            "type": TYPE_LABELS.get(kind, "Assignment"),
+            "kind": kind,
         }
-    return items, dropped
+    undated = sum(1 for i in items.values() if not i["due"])
+    return items, dropped, undated
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +462,9 @@ def build_value(prop_type, value):
         return {"multi_select": [{"name": str(value)[:100]}]}
     if prop_type == "status":
         return {"status": {"name": str(value)[:100]}}
+    if prop_type == "relation":
+        ids = value if isinstance(value, list) else [value]
+        return {"relation": [{"id": i} for i in ids if i]}
     if prop_type == "number":
         try:
             return {"number": float(value)}
@@ -370,6 +496,9 @@ def read_plain(prop):
     if t == "status":
         s = prop.get("status")
         return s.get("name") if s else None
+    if t == "relation":
+        ids = [x.get("id") for x in prop.get("relation", []) if x.get("id")]
+        return ids or None
     return None
 
 
@@ -400,9 +529,12 @@ def main():
 
     print("Fetching Canvas calendar feed...")
     ics = fetch_ics(CFG["ics_url"])
-    items, dropped = collect_assignments(ics, CFG["tz"])
+    items, dropped, undated = collect_assignments(ics, CFG["tz"])
     print(f"  {len(items)} gradeable item(s) found; "
           f"{dropped} non-gradeable calendar entr(ies) filtered out.")
+    if undated:
+        print(f"  {undated} item(s) have no due date in the Canvas feed - "
+              "they'll sync with the date left blank.")
 
     notion = Notion(CFG["token"])
     schema = notion.get_database(db_id).get("properties", {})
@@ -436,10 +568,29 @@ def main():
             "Add it in Notion (type: Text) and re-run.")
 
     status_prop = None
-    for name, meta in schema.items():
-        if meta.get("type") in ("status", "select") and name == "Status":
-            status_prop = (name, meta["type"])
-            break
+    if CFG["p_status"] in schema and \
+            schema[CFG["p_status"]].get("type") in ("status", "select"):
+        status_prop = (CFG["p_status"], schema[CFG["p_status"]]["type"])
+
+    # Course may be a plain text/select column, or a relation pointing at a
+    # separate Courses database. Only the relation case needs a lookup table.
+    resolver = None
+    if "course" in resolved and resolved["course"][1] == "relation":
+        rel = schema[resolved["course"][0]].get("relation", {})
+        related_db = rel.get("database_id")
+        if not related_db:
+            die(f"Couldn't read which database '{resolved['course'][0]}' "
+                "points at. Re-share the Courses database with the "
+                "integration too - a relation needs access to both.")
+        print(f"Loading course pages from the related database...")
+        resolver = CourseResolver(
+            notion, related_db.replace("-", ""),
+            load_json_env(CFG["course_aliases"], "COURSE_ALIASES"),
+        )
+        print(f"  {len(resolver.by_norm)} course page(s) available.")
+
+    type_map = dict(TYPE_LABELS)
+    type_map.update(load_json_env(CFG["type_map"], "TYPE_MAP"))
 
     print("Loading existing Notion rows...")
     existing = {}
@@ -452,13 +603,20 @@ def main():
     created = updated = unchanged = 0
 
     for cid, item in sorted(items.items(), key=lambda kv: kv[1]["due"] or ""):
+        course_value = item["course"]
+        if resolver is not None:
+            page_id = resolver.resolve(item["course"])
+            if page_id is None and CFG["course_create_missing"] and item["course"]:
+                page_id = resolver.create(item["course"])
+            course_value = [page_id] if page_id else None
+
         values = {
             "title": item["title"],
             "due": item["due"],
-            "course": item["course"],
+            "course": course_value,
             "canvas_id": item["canvas_id"],
             "url": item["url"],
-            "type": item["type"],
+            "type": infer_type(item["title"], item["kind"], type_map),
         }
         page = existing.get(cid)
 
@@ -521,6 +679,29 @@ def main():
             notion.update_page(page["id"], changes)
             print(f"  ~ updated: {item['title']} ({', '.join(changes)})")
         updated += 1
+
+    if resolver is not None and resolver.seen:
+        print("\n" + "=" * 62)
+        print("COURSE MAPPING")
+        print("=" * 62)
+        print(f"{'Canvas calls it':<30} -> Notion Courses page")
+        print("-" * 62)
+        for canvas_name in sorted(resolver.seen):
+            title, how = resolver.seen[canvas_name]
+            target = f"{title}  ({how})" if title else "*** NO MATCH ***"
+            print(f"{canvas_name[:29]:<30} -> {target}")
+        print("-" * 62)
+        print(f"Your Courses database contains: "
+              f"{', '.join(sorted(t for _, t in resolver.by_norm.values()))}")
+
+        if resolver.unmatched:
+            print("\nRows for the unmatched course(s) synced with the Course "
+                  "relation left empty. To link them, add a COURSE_ALIASES "
+                  "repository secret shaped like this:")
+            pairs = ", ".join(f'"{n}": "PUT COURSE PAGE NAME HERE"'
+                              for n in sorted(resolver.unmatched))
+            print(f"    {{{pairs}}}")
+        print("=" * 62)
 
     print("\nDone. "
           f"{created} added, {updated} updated, {unchanged} already current.")
